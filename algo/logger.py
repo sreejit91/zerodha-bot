@@ -1,99 +1,106 @@
-"""Trade & event logger – SQLite‑backed.
-
-Table **trades** schema
------------------------
-id          INTEGER  PK  autoincrement
-timestamp   TEXT     ISO‑8601
-symbol      TEXT     eg. "BANKNIFTY24JUNFUT" or "PnL"
-side        TEXT     BUY / SELL / CLOSE
-qty         INTEGER  number of lots / shares
-price       REAL     fill price; 0 for PnL rows
-pnl         REAL     closed‑trade PnL in rupees (optional)
-broker_id   TEXT     Kite order‑id (nullable)
 """
+logger.py – SQLite-backed trade logger with full fee & P/L reporting
+(rev 2 – adds Order alias for backward compatibility)
+"""
+
 from __future__ import annotations
-import sqlite3, datetime as _dt
+import sqlite3, json, datetime as _dt
 from dataclasses import dataclass
 from pathlib import Path
 import pandas as pd
 
 DB_PATH = Path("trades.sqlite")
 
+# ─── dataclasses ────────────────────────────────────────────────────
 @dataclass(slots=True)
-class Order:
+class OpenTrade:
     timestamp: _dt.datetime
     symbol: str
-    side: str  # "BUY" | "SELL"
+    side: str            # BUY / SELL
     qty: int
     price: float
-    broker_id: str | None = None
+    sl: float
+    tp: float
 
+@dataclass(slots=True)
+class CloseTrade:
+    timestamp: _dt.datetime
+    symbol: str
+    qty: int
+    price: float
+    reason: str          # TP / SL / TIME
+    fee_detail: dict
+    gross_pnl: float
+    net_pnl: float
 
+# ─── durable logger ─────────────────────────────────────────────────
 class TradeLogger:
-    """Minimal but robust trade logger."""
-
     def __init__(self, db_path: Path = DB_PATH):
         self.conn = sqlite3.connect(db_path)
         self._create_table()
 
-    # ---------------------------------------------------------------------
-    #  Public helpers
-    # ---------------------------------------------------------------------
-    def log(self, order: Order):
-        """Log a live trade (BUY / SELL)."""
+    # PUBLIC API -----------------------------------------------------
+    def log_open(self, trade: OpenTrade):
         self.conn.execute(
-            "INSERT INTO trades (timestamp, symbol, side, qty, price, broker_id) "
-            "VALUES (?,?,?,?,?,?)",
+            """INSERT INTO trades
+               (timestamp,symbol,event,side,qty,price,sl,tp)
+               VALUES (?,?,?,?,?,?,?,?)""",
             (
-                order.timestamp.isoformat(),
-                order.symbol,
-                order.side,
-                order.qty,
-                order.price,
-                order.broker_id,
+                trade.timestamp.isoformat(),
+                trade.symbol,
+                "OPEN",
+                trade.side,
+                trade.qty,
+                trade.price,
+                trade.sl,
+                trade.tp,
             ),
         )
         self.conn.commit()
 
-    def log_pnl(self, pnl: float):
-        """Insert a synthetic row with the closed‑trade PnL (called on exit)."""
+    def log_close(self, trade: CloseTrade):
         self.conn.execute(
-            "INSERT INTO trades (timestamp, symbol, side, qty, price, pnl, broker_id) "
-            "VALUES (?,?,?,?,?,?,?)",
+            """INSERT INTO trades
+               (timestamp,symbol,event,qty,price,reason,
+                fee_json,gross_pnl,net_pnl)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
             (
-                _dt.datetime.now().isoformat(),
-                "PnL",
+                trade.timestamp.isoformat(),
+                trade.symbol,
                 "CLOSE",
-                0,
-                0.0,
-                pnl,
-                None,
+                trade.qty,
+                trade.price,
+                trade.reason,
+                json.dumps(trade.fee_detail, separators=(",", ":")),
+                trade.gross_pnl,
+                trade.net_pnl,
             ),
         )
         self.conn.commit()
 
-    def summary(self) -> tuple[float, float]:
-        """Return (total_PnL, win_rate%)."""
-        df = pd.read_sql("SELECT * FROM trades WHERE pnl IS NOT NULL", self.conn)
-        if df.empty:
-            return 0.0, 0.0
-        total = df.pnl.sum()
-        win_rate = (df.pnl > 0).mean() * 100
-        return float(total), float(win_rate)
+    def summary(self) -> pd.DataFrame:
+        return pd.read_sql("SELECT * FROM trades ORDER BY id", self.conn)
 
-    # ------------------------------------------------------------------
-    #  Internal
-    # ------------------------------------------------------------------
+    # INTERNAL -------------------------------------------------------
     def _create_table(self):
         self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS trades ("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-            "timestamp TEXT,"
-            "symbol TEXT,"
-            "side TEXT,"
-            "qty INTEGER,"
-            "price REAL,"
-            "pnl REAL,"
-            "broker_id TEXT)"
+            """CREATE TABLE IF NOT EXISTS trades (
+               id         INTEGER PRIMARY KEY AUTOINCREMENT,
+               timestamp  TEXT,
+               symbol     TEXT,
+               event      TEXT,
+               side       TEXT,
+               qty        INTEGER,
+               price      REAL,
+               sl         REAL,
+               tp         REAL,
+               reason     TEXT,
+               fee_json   TEXT,
+               gross_pnl  REAL,
+               net_pnl    REAL
+            )"""
         )
         self.conn.commit()
+
+# ─── backward-compatibility alias ───────────────────────────────────
+Order = OpenTrade      # old imports still work ⇢  from algo.logger import Order

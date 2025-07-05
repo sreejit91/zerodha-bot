@@ -1,15 +1,16 @@
 """
-run_paper_ws.py  –  Live 3-minute paper-trading loop
-────────────────────────────────────────────────────────────────────────
-• EMA-3/4/8/9/21, ATR, RSI, MACD, OBV, rv20
-• Seeds 70 bars so indicators are warm
-• SL / TP / TRAIL / TIME exits
-• Debug print of ema crossover + position age
-Ctrl-C to stop.
+run_paper_ws.py  –  Live 3-minute paper-trading loop  (debug v5)
+
+NEW IN v5
+─────────
+• Integrates the SQLite-based logger (logger.py):
+  ─ logs every OPEN (side, qty, price, SL, TP)
+  ─ logs every CLOSE (reason, fee breakdown, gross & net P/L)
+• All previous fixes: quantity-scaled TP, detailed console prints, etc.
 """
 
 from __future__ import annotations
-import datetime as dt, collections
+import datetime as dt, sys, collections, itertools
 import pandas as pd
 from kiteconnect import KiteTicker
 
@@ -17,200 +18,216 @@ from algo.config   import load_config
 from algo.broker   import KiteWrapper
 from algo.features import add_indicators
 from algo.model    import load_or_train, predict_last, LOOKBACK
-from algo.backtester import zerodha_cost
+from algo.backtester import calculate_zerodha_fees
+
+# 🚀  TRADE LOGGER  ───────────────────────────────────────────────────
+from logger import TradeLogger, OpenTrade, CloseTrade
+logger = TradeLogger()                            # durable SQLite log
 
 # ─── parameters ──────────────────────────────────────────────────────
-SYMBOL    = "RELIANCE"
-TOKEN     = 738561
-INTERVAL  = 180          # 3-minute bar
-WINDOW    = 70           # deque length  (>= LOOKBACK + warm-up)
+SYMBOL, TOKEN = "HDFCBANK", 341249
+INTERVAL      = 180
+WINDOW        = LOOKBACK + 10
 
-SL_PCT    = 0.0012       # initial stop  0.12 %
-TP_PCT    = 0.0025       # fixed target  0.20 %
-TRAIL_PCT = 0.0025       # distance of trailing stop from price (0.15 %)
-HOLD_MAX  = 15           # time-stop after 30 bars  (≈ 90 min)
+INITIAL_CAPITAL = 100_000
+SL_PCT, TP_PCT, TRAIL_PCT = 0.0015, 0.0045, 0.0020
+HOLD_MAX  = 10
+UPPER, LOWER = 0.50, 0.40
 
-UPPER     = 0.63         # long gate
-LOWER     = 0.37         # short gate
-CONTRACTS = 1
+WINDOWS = [(dt.time(9, 15), dt.time(15, 25))]
+is_mkt_hours = lambda t: any(a <= t <= b for a, b in WINDOWS)
+now_ist = lambda: dt.datetime.now(dt.timezone(dt.timedelta(hours=5, minutes=30)))
 
-# trade windows
-WINDOWS   = [(dt.time(9, 15), dt.time(15, 25))]
+# ─── bootstrap ───────────────────────────────────────────────────────
+print(f"🟢 Boot {now_ist():%Y-%m-%d %H:%M:%S} IST", flush=True)
 
-# ─── initialise ──────────────────────────────────────────────────────
 cfg  = load_config()
 wrap = KiteWrapper(cfg)
 
-model = load_or_train(
-    add_indicators(
-        wrap.history(days=1, interval="3minute", tradingsymbol=SYMBOL)
-    ),
-    retrain=False,
-)
+print("⏳ Loading model / warm history …", flush=True)
+hist = wrap.history(days=200, interval="3minute", tradingsymbol=SYMBOL)
+df   = add_indicators(hist).ffill()
+model = load_or_train(df.iloc[:-20], retrain=False)
+print("✅ Model ready", flush=True)
 
-bars: "collections.deque[pd.Series]" = collections.deque(maxlen=WINDOW)
-
-# seed deque
-for ts, row in wrap.history(days=1, interval="3minute",
-                            tradingsymbol=SYMBOL).tail(WINDOW).iterrows():
+# seed bars
+bars: collections.deque[pd.Series] = collections.deque(maxlen=WINDOW)
+seed = wrap.history(days=1, interval="3minute", tradingsymbol=SYMBOL).tail(WINDOW)
+for ts, row in seed.iterrows():
     s = row.copy()
     s.name = ts.replace(second=0, microsecond=0)
     s["_processed"] = True
+    s["_last"] = s["close"]
     bars.append(s)
 
-# ─── position state ──────────────────────────────────────────────────
-in_pos   = 0        # -1 short, 0 flat, +1 long
-entry_px = 0.0
-sl_px    = 0.0
-trade_age = 0       # bars inside current position
-pnl      = 0.0
+print(f"✅ Warm-up completed with {len(bars)} cached bars; ready to trade.", flush=True)
 
-probs: list[float] = []     # diagnostics
+# ─── trading state ───────────────────────────────────────────────────
+equity = INITIAL_CAPITAL
+in_pos = 0
+entry_px = sl_px = tp_px = 0.0
+trade_age = 0
+tick_counter = itertools.count(1)
 
 # ─── websocket handlers ──────────────────────────────────────────────
-def on_ticks(ws, ticks):
-    global in_pos, entry_px, sl_px, trade_age, pnl
-    try:
-        for t in ticks:
-            ltp = t["last_price"]
-            ts  = (t.get("last_trade_time")
-                   or dt.datetime.now(dt.timezone.utc)).astimezone()
-
-            bar_ts      = ts.replace(second=0, microsecond=0)
-            current_key = bars[-1].name if bars else None
-
-            # ── bar rollover ────────────────────────────────────────
-            if current_key != bar_ts:
-                if bars:
-                    prev = bars[-1]
-                    if "_last" in prev:
-                        prev["close"] = prev["_last"]
-                        prev["high"]  = max(prev["high"], prev["_last"])
-                        prev["low"]   = min(prev["low"],  prev["_last"])
-                        del prev["_last"]
-                bars.append(pd.Series(dict(open=ltp, high=ltp, low=ltp,
-                                           close=ltp, volume=1, _last=ltp),
-                                       name=bar_ts))
-            else:
-                bar = bars[-1]
-                bar["_last"] = ltp
-                bar["high"]  = max(bar["high"], ltp)
-                bar["low"]   = min(bar["low"],  ltp)
-                bar["volume"] += 1
-
-            # need a newly closed bar
-            if len(bars) < 2 or bars[-2].get("_processed"):
-                return
-
-            bar_cl = bars[-2]
-            bar_cl["_processed"] = True
-            price   = bar_cl["close"]
-            ts_bar  = bar_cl.name.time()
-
-            # ── build feature frame ────────────────────────────────
-            df_win = (pd.DataFrame(list(bars))
-                      .drop(columns=["_processed", "_last"], errors="ignore"))
-            df_feat = add_indicators(df_win.copy()).ffill()
-            df_feat_closed = df_feat.iloc[:-1]
-
-            if (len(df_feat_closed) < LOOKBACK or
-                df_feat_closed.tail(LOOKBACK).isna().any().any()):
-                print(ts_bar, "waiting for full LOOKBACK …")
-                return
-
-            prob = predict_last(df_feat_closed, model)
-            probs.append(prob)
-            if len(probs) == 60:      # hourly diagnostics
-                print("\nProb summary:",
-                      "min", f"{min(probs):.2f}",
-                      "mean", f"{sum(probs)/len(probs):.2f}",
-                      "95-pct", f"{sorted(probs)[int(0.95*len(probs))]:.2f}",
-                      "max", f"{max(probs):.2f}\n")
-                probs.clear()
-
-            ema3 = df_feat_closed["ema_3"].iat[-1]
-            ema8 = df_feat_closed["ema_8"].iat[-1]
-
-            print(ts_bar, "DEBUG",
-                  f"ema3={ema3:.2f}", f"ema8={ema8:.2f}",
-                  "longTrend", ema3 > ema8,
-                  "shortTrend", ema3 < ema8)
-
-            long_ok  = prob >= UPPER and ema3 > ema8
-            short_ok = prob <= LOWER and ema3 < ema8
-            if not any(a <= ts_bar <= b for a, b in WINDOWS):
-                long_ok = short_ok = False
-
-            # ─── manage open position ───────────────────────────────
-            if in_pos:
-                trade_age += 1
-
-                # --- trailing stop update --------------------------
-                trail_dist = TRAIL_PCT * entry_px
-                if in_pos == 1:            # long
-                    new_sl = price - trail_dist
-                    if new_sl > sl_px:
-                        sl_px = new_sl
-                else:                      # short
-                    new_sl = price + trail_dist
-                    if new_sl < sl_px:
-                        sl_px = new_sl
-                # ---------------------------------------------------
-
-                pl = (price - entry_px) / entry_px * in_pos
-                sl_exit   = (price <= sl_px) if in_pos == 1 else (price >= sl_px)
-                tp_exit   = pl >= TP_PCT if in_pos == 1 else pl <= -TP_PCT
-                time_exit = trade_age >= HOLD_MAX
-
-                if sl_exit or tp_exit or time_exit:
-                    reason = ("SL" if sl_exit else
-                              "TP" if tp_exit else "TIME")
-                    fee = zerodha_cost(price*CONTRACTS,
-                                       "SELL" if in_pos == 1 else "BUY")
-                    pnl += pl*100_000*CONTRACTS - fee
-                    print(ts_bar, f"EXIT {reason}",
-                          f"{price:.2f}", "pnl", f"{pnl:+,.0f}",
-                          "held", trade_age, "bars")
-                    in_pos = 0
-                    trade_age = 0
-
-            # ─── check for new entry ────────────────────────────────
-            if in_pos == 0:
-                if long_ok:
-                    in_pos, entry_px = 1, price
-                    sl_px = entry_px * (1 - SL_PCT)
-                    trade_age = 0
-                    pnl -= zerodha_cost(price*CONTRACTS, "BUY")
-                    print(ts_bar, "BUY ", f"{entry_px:.2f}")
-                elif short_ok:
-                    in_pos, entry_px = -1, price
-                    sl_px = entry_px * (1 + SL_PCT)
-                    trade_age = 0
-                    pnl -= zerodha_cost(price*CONTRACTS, "SELL")
-                    print(ts_bar, "SELL", f"{entry_px:.2f}")
-
-            # heartbeat
-            age_txt = trade_age if in_pos else "-"
-            print(ts_bar, "bar close", f"{price:.2f}",
-                  "prob", f"{prob:.2f}", "pos", in_pos,
-                  "age", age_txt, "SL", f"{sl_px:.2f}" if in_pos else "-")
-
-    except Exception as e:
-        print("Handler error:", e)
-
 def on_connect(ws, _):
-    print("✅ websocket connected")
+    print("✅ Connected – subscribing now …", flush=True)
+    print(f"   Tokens → [{TOKEN}]", flush=True)
     ws.subscribe([TOKEN])
     ws.set_mode(ws.MODE_QUOTE, [TOKEN])
 
-# ─── run ─────────────────────────────────────────────────────────────
-print("🟢 Connecting websocket …  Ctrl-C to stop")
-ws = KiteTicker(cfg.api_key, cfg.access_token)
-ws.on_connect = on_connect
-ws.on_ticks   = on_ticks
+def on_ticks(ws, ticks):
+    global equity, in_pos, entry_px, sl_px, tp_px, trade_age
 
-try:
-    ws.connect(threaded=False)
-except KeyboardInterrupt:
-    print("\n🔴 stopped. Net PnL:", round(pnl, 2))
-    ws.close()
+    # heartbeat
+    for _ in ticks:
+        c = next(tick_counter)
+        if c % 100 == 0:
+            print(f"📡 heartbeat tick #{c}", flush=True)
+
+    # build bars
+    for t in ticks:
+        ltp = t["last_price"]
+        ts  = (t.get("last_trade_time") or dt.datetime.now(dt.timezone.utc)).astimezone()
+        key = ts.replace(second=0, microsecond=0)
+
+        if not bars or bars[-1].name != key:
+            if bars and "_last" in bars[-1]:
+                prev = bars[-1]
+                prev["close"] = prev.pop("_last")
+                prev["high"]  = max(prev["high"], prev["close"])
+                prev["low"]   = min(prev["low"], prev["close"])
+            bars.append(pd.Series({"open": ltp, "high": ltp, "low": ltp,
+                                   "close": ltp, "volume": 1, "_last": ltp},
+                                  name=key))
+        else:
+            b = bars[-1]
+            b["_last"]  = ltp
+            b["high"]   = max(b["high"], ltp)
+            b["low"]    = min(b["low"], ltp)
+            b["volume"] += 1
+
+    # process closed bar
+    if len(bars) < 2 or bars[-2].get("_processed"):
+        return
+    bar = bars[-2]; bar["_processed"] = True
+    price, ts_time = bar["close"], bar.name.time()
+
+    df_win  = pd.DataFrame([b.drop(["_processed", "_last"], errors="ignore") for b in bars])
+    df_feat = add_indicators(df_win).ffill()
+    df_closed = df_feat.iloc[:-1]
+    if len(df_closed) < LOOKBACK:
+        return
+
+    prob = predict_last(df_closed, model)
+    ema3, ema8 = df_closed["ema_3"].iat[-1], df_closed["ema_8"].iat[-1]
+    long_ok  = prob >= UPPER and ema3 > ema8 and is_mkt_hours(ts_time)
+    short_ok = prob <= LOWER and ema3 < ema8 and is_mkt_hours(ts_time)
+
+    print(f"{ts_time} prob={prob:.2f} ema3={ema3:.2f} ema8={ema8:.2f} "
+          f"long_ok={long_ok} short_ok={short_ok}", flush=True)
+
+    # ── manage open trade ──────────────────────────────────────────
+    if in_pos:
+        trade_age += 1
+        sl_px = max(sl_px, price - entry_px * TRAIL_PCT) if in_pos > 0 else \
+                min(sl_px, price + entry_px * TRAIL_PCT)
+
+        pnl = (price - entry_px) * in_pos
+        exit_sl = (price <= sl_px) if in_pos > 0 else (price >= sl_px)
+        exit_tp = (pnl >=  TP_PCT * abs(entry_px) * abs(in_pos)) if in_pos > 0 else \
+                  (pnl <= -TP_PCT * abs(entry_px) * abs(in_pos))
+        exit_tm = (trade_age >= HOLD_MAX)
+
+        if exit_sl or exit_tp or exit_tm:
+            reason = "SL" if exit_sl else "TP" if exit_tp else "TIME"
+            fee_detail = calculate_zerodha_fees(entry_px, price,
+                                                abs(in_pos), debug=True)
+            fee_total = fee_detail.get("total", sum(fee_detail.values())) \
+                        if isinstance(fee_detail, dict) else fee_detail
+            net = pnl - fee_total
+            equity += net
+
+            print(f"💔 {ts_time} EXIT {reason} @ {price:.2f}  "
+                  f"gross={pnl:+.2f}  fees={fee_total:.2f}  net={net:+.2f}\n"
+                  f"   fee-breakup → {fee_detail}", flush=True)
+
+            # 📜  log CLOSE
+            logger.log_close(
+                CloseTrade(
+                    timestamp=bar.name,
+                    symbol=SYMBOL,
+                    qty=abs(in_pos),
+                    price=price,
+                    reason=reason,
+                    fee_detail=fee_detail if isinstance(fee_detail, dict)
+                               else {"total": fee_total},
+                    gross_pnl=pnl,
+                    net_pnl=net,
+                )
+            )
+
+            in_pos = 0; trade_age = 0
+
+    # ── enter trade? ───────────────────────────────────────────────
+    if in_pos == 0:
+        qty = int(equity // price)
+        if qty >= 1 and long_ok:
+            in_pos =  qty
+            entry_px = price
+            sl_px = entry_px * (1 - SL_PCT)
+            tp_px = entry_px * (1 + TP_PCT)
+            equity -= calculate_zerodha_fees(entry_px, entry_px, qty)
+            print(f"🟢 {ts_time} BUY  {qty} @ {entry_px:.2f}  "
+                  f"SL:{sl_px:.2f}  TP:{tp_px:.2f}", flush=True)
+
+            # 📜  log OPEN
+            logger.log_open(
+                OpenTrade(
+                    timestamp=bar.name,
+                    symbol=SYMBOL,
+                    side="BUY",
+                    qty=qty,
+                    price=entry_px,
+                    sl=sl_px,
+                    tp=tp_px,
+                )
+            )
+
+        elif qty >= 1 and short_ok:
+            in_pos = -qty
+            entry_px = price
+            sl_px = entry_px * (1 + SL_PCT)
+            tp_px = entry_px * (1 - TP_PCT)
+            equity -= calculate_zerodha_fees(entry_px, entry_px, qty)
+            print(f"🔴 {ts_time} SELL {qty} @ {entry_px:.2f}  "
+                  f"SL:{sl_px:.2f}  TP:{tp_px:.2f}", flush=True)
+
+            logger.log_open(
+                OpenTrade(
+                    timestamp=bar.name,
+                    symbol=SYMBOL,
+                    side="SELL",
+                    qty=qty,
+                    price=entry_px,
+                    sl=sl_px,
+                    tp=tp_px,
+                )
+            )
+
+# ─── main ────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    if sys.stdout and not sys.stdout.isatty():
+        print("⚠️  Tip: run with  `python -u run_paper_ws.py` for unbuffered logs.",
+              flush=True)
+
+    ws = KiteTicker(cfg.api_key, cfg.access_token)
+    ws.on_connect = on_connect
+    ws.on_ticks   = on_ticks
+
+    print("🟢 Starting live paper-trade loop (Ctrl-C to stop) …", flush=True)
+    try:
+        ws.connect(threaded=False)
+    except KeyboardInterrupt:
+        print(f"\n🔴 Stopped. Final equity ₹{equity:.2f}", flush=True)
+        ws.close()
