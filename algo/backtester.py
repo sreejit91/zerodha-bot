@@ -1,160 +1,223 @@
-"""
-algo/backtester.py
-────────────────────────────────────────────────────────────────────────
-Vectorised intraday back-tester that mirrors the live-trading loop:
-
-• works on any feature-enriched DataFrame (call add_indicators() first)
-• supports fixed SL / TP, trailing stop, time-stop
-• includes Zerodha all-in cost model (brokerage + taxes)
-"""
-
-from __future__ import annotations
-import numpy as np
+# Enhanced backtester with raw-data diagnostics, detailed trade log, lookback-guard, Zerodha fee calculation (with breakdown), exit reasons, dynamic position sizing and empty-list guards
 import pandas as pd
-from typing import Tuple, List, Dict
+import numpy as np
+from typing import Tuple, Callable, Optional
+from algo.model import LOOKBACK
 
-from .features import FEATURES, add_indicators          # FEATURES list
-from .model    import predict_last, LOOKBACK            # model helpers
+# Zerodha fee schedule constants
+# Intraday equity: brokerage is min(0.03% of turnover, ₹20 per executed order)
+BROKERAGE_RATE = 0.0003
+MAX_BROKERAGE = 20.0
+# Exchange transaction charge (NSE): 0.00325% of turnover
+TXN_CHARGES_RATE = 0.0000325
+# SEBI charges: often ~0.0000005 of turnover
+SEBI_CHARGES_RATE = 0.0000005
+# GST on (brokerage + transaction charges)
+GST_RATE = 0.18
+# Stamp duty on buy-side turnover: 0.003%
+STAMP_DUTY_RATE = 0.00003
 
-# ════════════════════════════════════════════════════════════════════
-# Zerodha fee helper (embedded – no external import needed)
-# ════════════════════════════════════════════════════════════════════
-def zerodha_cost(turnover: float, side: str = "BUY") -> float:
+def calculate_zerodha_fees(entry_price: float, exit_price: float, quantity: int, debug: bool=False) -> float:
     """
-    Approximate all-in cost (brokerage + STT + exchange + GST + stamp duty)
-    for an equity intraday trade.
-
-    Parameters
-    ----------
-    turnover : float
-        price × quantity for **this leg** of the trade.
-    side : {"BUY", "SELL"}
-        Cost differs slightly on BUY vs SELL because stamp duty (buy only)
-        and STT (sell only).
-
-    Returns
-    -------
-    float  – positive rupee amount you should subtract from PnL.
+    Compute Zerodha-style fees for one round-trip trade of given quantity.
+    If debug=True, prints detailed breakdown.
     """
-    brk   = min(0.0003 * turnover, 20)            # brokerage 0.03 % capped 20
-    exch  = 0.0000325 * turnover                  # exchange txn
-    sebi  = 0.000001  * turnover                  # SEBI
-    gst   = 0.18 * (brk + exch)                   # GST on (brk+exch)
-    stamp = 0.00003  * turnover if side == "BUY"  else 0
-    stt   = 0.00025  * turnover if side == "SELL" else 0
-    return brk + exch + sebi + gst + stamp + stt
+    turnover = (entry_price + exit_price) * quantity
+    per_leg_brokerage = min(turnover * BROKERAGE_RATE, MAX_BROKERAGE)
+    brokerage = per_leg_brokerage * 2
+    txn_charges = turnover * TXN_CHARGES_RATE
+    sebi_charges = turnover * SEBI_CHARGES_RATE
+    gst = (brokerage + txn_charges) * GST_RATE
+    stamp_duty = entry_price * quantity * STAMP_DUTY_RATE
+    total_fees = brokerage + txn_charges + sebi_charges + gst + stamp_duty
+    if debug:
+        print(f"[fees] entry={entry_price:.2f}, exit={exit_price:.2f}, qty={quantity}")
+        print(f"[fees]  > turnover={turnover:.2f}, brokerage(total)={brokerage:.2f} "
+              f"(per leg={per_leg_brokerage:.2f}), txn={txn_charges:.4f}, sebi={sebi_charges:.4f}, gst={gst:.4f}, stamp={stamp_duty:.4f}")
+        print(f"[fees]  >> total fees={total_fees:.4f}\n")
+    return total_fees
 
 
-# ════════════════════════════════════════════════════════════════════
-# Back-test core
-# ════════════════════════════════════════════════════════════════════
 def backtest(
-    df_raw      : pd.DataFrame,
+    df_raw: pd.DataFrame,
     model,
-    capital     : float = 100_000,
-    contract_size : int   = 1,
-    sl_pct      : float = 0.0012,
-    tp_pct      : float = 0.0027,
-    trail_pct   : float = 0.0020,
-    hold_max    : int   = 30,       # bars
-    upper       : float = 0.60,
-    lower       : float = 0.40,
-) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    capital: float,
+    contract_size: int,
+    sl_pct: float,
+    tp_pct: float,
+    trail_pct: float,
+    hold_max: int,
+    upper: float,
+    lower: float,
+    predict_fn: Callable,
+    slippage_pct: float = 0.0,
+    fill_rate: float = 1.0,
+    skip_indicator: Optional[Callable] = None,
+    debug: bool = True,
+) -> Tuple[pd.DataFrame, dict]:
     """
-    Simulate a long/short single-position strategy on *df_raw*.
-
-    df_raw **must already contain** the indicator columns in FEATURES.
-
-    Returns
-    -------
-    trades : DataFrame   – every fill & exit row-by-row
-    metrics: dict        – summary (trades, win-rate, PnL …)
+    Run backtest recording entries/exits, PnL including Zerodha fees, exit reasons,
+    guard initial lookback, and print probability distribution for diagnostics.
+    Uses full equity to size each entry (qty = int(equity // price)).
+    Returns completed trades DataFrame and performance metrics.
     """
-    # Ensure DataFrame is sorted & has the needed return column
-    df = df_raw.sort_index().copy()
-    if "ret1" not in df.columns:
-        df["ret1"] = df["close"].pct_change()
+    df = df_raw.copy().sort_index()
+    # remove any duplicate bars, keep the first of each timestamp
+    df = df[~df.index.duplicated(keep="first")]
 
-    FEATURE_COLS = FEATURES                         # shorthand
+    # re‐sort and sanity‐check monotonicity
+    df = df.sort_index()
+    if not df.index.is_monotonic_increasing and debug:
+        print("[backtest] WARNING: index still not monotonic!")
+    if debug:
+        print(f"[backtest] raw df shape: {df.shape}")
+        print(f"[backtest] columns: {list(df.columns)}")
+        print(f"[backtest] index type: {type(df.index)}, freq: {df.index.freq}")
+        print(df.head())
+        if df.empty:
+            print("[backtest] WARNING: DataFrame is empty. No bars to process.")
 
-    equity   = capital
-    in_pos   = 0            # +1 long, −1 short, 0 flat
-    entry_px = 0.0
-    sl_px    = tp_px = 0.0
-    age      = 0
+    equity = capital
+    position = 0        # signed quantity
+    entry_price = 0.0
+    entry_index = None
+    trades = []
+    signal_count = 0
+    total_bars = 0
+    skip_count = 0
+    above_count = 0
+    below_count = 0
+    probs = []
 
-    rows: List[dict] = []
+    def record_trade(side, entry_ts, exit_ts, entry_px, exit_px, gross_pnl, fees, qty, net_pnl, equity_after, reason):
+        trades.append({
+            'entry_ts': entry_ts,
+            'exit_ts': exit_ts,
+            'side': side,
+            'entry_price': entry_px,
+            'exit_price': exit_px,
+            'exit_reason': reason,
+            'fees': fees,
+            'qty': qty,
+            'pnl': net_pnl,
+            'equity': equity_after,
+        })
 
-    for idx, row in df.iterrows():
-        price = row["close"]
+    # infer bar frequency
+    freq_minutes = None
+    if df.index.freq:
+        freq_minutes = int(df.index.freq.delta.total_seconds() / 60)
+    elif len(df.index) > 1:
+        diffs = df.index.to_series().diff().dropna()
+        if not diffs.empty:
+            freq_minutes = int(diffs.mode()[0].total_seconds() / 60)
 
-        # 1) calculate ML probability on last *LOOKBACK* closed bars
-        window = df.loc[:idx].tail(LOOKBACK)
+    if debug:
+        print(f"[backtest] thresholds -> upper={upper}, lower={lower}")
+        print(f"[backtest] required lookback rows: {LOOKBACK}")
 
-        # skip until full window w/o NaNs
-        if window[FEATURE_COLS].isna().any().any():
+    for idx, ts in enumerate(df.index):
+        total_bars += 1
+        # guard for lookback
+        if idx + 1 < LOOKBACK:
             continue
-        prob = predict_last(window, model)
+        window = df.iloc[idx + 1 - LOOKBACK : idx + 1]
+        row = df.iloc[idx]
+        if skip_indicator and skip_indicator(row):
+            skip_count += 1
+            continue
 
-        # 2) trend filter (ema_3 vs ema_8)
-        ema3, ema8 = row["ema_3"], row["ema_8"]
-        long_ok  = prob >= upper and ema3 > ema8
-        short_ok = prob <= lower and ema3 < ema8
+        prob = predict_fn(window, model)
+        probs.append(prob)
+        price = row.get('close', None)
+        if price is None:
+            continue
 
-        # 3) exit logic first ------------------------------------------------
-        exit_reason = None
-        if in_pos != 0:
-            age += 1
-            # trailing SL update
-            if in_pos == 1:          # long
-                sl_px = max(sl_px, price * (1 - trail_pct))
-            else:                    # short
-                sl_px = min(sl_px, price * (1 + trail_pct))
+        # ENTRY
+        if position == 0:
+            if prob >= upper or prob <= lower:
+                signal_count += 1
+                # size using full available equity
+                qty = int(equity // price)
+                if qty < 1:
+                    if debug:
+                        print(f"{ts} SKIP ENTRY, insufficient equity for one share @ {price:.2f}")
+                    continue
+                entry_price = price * (1 + slippage_pct) if prob >= upper else price * (1 - slippage_pct)
+                position = qty if prob >= upper else -qty
+                entry_index = ts
+                side_str = 'BUY' if position > 0 else 'SELL'
+                if debug:
+                    print(f"{ts} SIGNAL {side_str} @ prob={prob:.3f}")
+                    print(f"{ts} ENTRY {side_str} @ qty={qty} price={entry_price:.2f}\n")
+                # reset counters for exit-tracking
+                entry_ts = ts
+                continue
 
-            hit_sl  = (price <= sl_px) if in_pos == 1 else (price >= sl_px)
-            hit_tp  = (price >= tp_px) if in_pos == 1 else (price <= tp_px)
-            time_up = age >= hold_max
+        # EXIT conditions
+        if position != 0:
+            qty = abs(position)
+            stop = entry_price * (1 - sl_pct) if position > 0 else entry_price * (1 + sl_pct)
+            target = entry_price * (1 + tp_pct) if position > 0 else entry_price * (1 - tp_pct)
+            exit_reason = None
+            exit_price = None
 
-            if hit_tp:  exit_reason = "TP"
-            elif hit_sl: exit_reason = "SL"
-            elif time_up: exit_reason = "TIME"
+            # stop-loss
+            if (position > 0 and price <= stop) or (position < 0 and price >= stop):
+                exit_reason, exit_price = 'SL', stop
+            # take-profit
+            elif (position > 0 and price >= target) or (position < 0 and price <= target):
+                exit_reason, exit_price = 'TP', target
+            # time-based
+            elif hold_max and freq_minutes:
+                held_min = (ts - entry_index).total_seconds() // 60
+                if held_min >= hold_max * freq_minutes:
+                    exit_reason, exit_price = 'TIME', price
 
             if exit_reason:
-                turnover = price * contract_size
-                fee      = zerodha_cost(turnover, "SELL" if in_pos==1 else "BUY")
-                pl_abs   = (price - entry_px) * in_pos * contract_size - fee
-                equity  += pl_abs
-                rows.append(dict(ts=idx, side="EXIT", price=price,
-                                 pnl=pl_abs, equity=equity,
-                                 reason=exit_reason))
-                in_pos = age = 0
+                gross_pnl = position * (exit_price - entry_price) * fill_rate
+                fees = calculate_zerodha_fees(entry_price, exit_price, qty, debug)
+                net_pnl = gross_pnl - fees
+                equity += net_pnl
+                side_str = 'BUY' if position > 0 else 'SELL'
+                if debug:
+                    print(f"{ts} EXIT {exit_reason} {side_str} @ price={exit_price:.2f} qty={qty} | "
+                          f"Gross={gross_pnl:.2f} Fees={fees:.2f} Net={net_pnl:.2f}\n")
+                print(f"Debug: qty={qty}\n")#temp code
+                record_trade(side_str, entry_index, ts, entry_price, exit_price,
+                             gross_pnl, fees, qty, net_pnl, equity, exit_reason)
+                # reset position
+                position = 0
+                entry_price = 0.0
+                entry_index = None
 
-        # 4) entry logic -----------------------------------------------------
-        if in_pos == 0:
-            if long_ok or short_ok:
-                in_pos   = 1 if long_ok else -1
-                entry_px = price
-                sl_px    = (price * (1 - sl_pct) if in_pos == 1
-                            else price * (1 + sl_pct))
-                tp_px    = (price * (1 + tp_pct) if in_pos == 1
-                            else price * (1 - tp_pct))
-                turnover = price * contract_size
-                fee      = zerodha_cost(turnover, "BUY" if in_pos==1 else "SELL")
-                equity  -= fee
-                rows.append(dict(ts=idx,
-                                 side="BUY" if in_pos==1 else "SELL",
-                                 price=price,
-                                 pnl=-fee,
-                                 equity=equity,
-                                 reason="ENTER"))
+    # diagnostics
+    if debug:
+        print(f"[backtest] processed bars: {total_bars}")
+        print(f"[backtest] skipped bars: {skip_count}")
+        if probs:
+            print(f"[backtest] prob stats: count={len(probs)}, min={np.min(probs):.3f}, max={np.max(probs):.3f}, mean={np.mean(probs):.3f}")
+            print(f"[backtest] signals fired: {signal_count}\n")
+        else:
+            print("[backtest] no probability values collected; check predict_fn and data.")
 
-    trades = pd.DataFrame(rows).set_index("ts")
+    # assemble trades DataFrame
+    trades_df = pd.DataFrame(trades)
+    if not trades_df.empty and 'entry_ts' in trades_df.columns:
+        trades_df.set_index('entry_ts', inplace=True)
 
-    metrics = dict(
-        Trades      = trades.side.isin(["BUY", "SELL"]).sum() // 2,
-        WinRate     = (trades.reason == "TP").sum() /
-                      max(1, trades.reason.isin(["TP", "SL", "TIME"]).sum()),
-        PnL         = trades.pnl.sum(),
-        EquityFinal = equity,
-    )
-    return trades, metrics
+    if debug:
+        print("[backtest] Full trade log:")
+        print(trades_df)
+
+    # performance metrics
+    metrics = {
+        'Signals': signal_count,
+        'Trades': int(len(trades_df)),
+        'WinRate': float((trades_df['pnl'] > 0).mean()) if not trades_df.empty else 0.0,
+        'GrossPnL': float((trades_df['pnl'] + trades_df['fees']).sum()) if not trades_df.empty else 0.0,
+        'Fees': float(trades_df['fees'].sum()) if not trades_df.empty else 0.0,
+        'NetPnL': float(trades_df['pnl'].sum()) if not trades_df.empty else 0.0,
+        'EquityFinal': float(equity),
+    }
+    return trades_df, metrics

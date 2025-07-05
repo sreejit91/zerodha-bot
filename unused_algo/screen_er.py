@@ -1,6 +1,6 @@
 """Very‑lightweight screener that picks the most liquid trending symbol from NIFTY‑50."""
 import pandas as pd
-from .features import add_indicators
+from algo.features import add_indicators
 
 WATCH = {
     "RELIANCE": 738561,

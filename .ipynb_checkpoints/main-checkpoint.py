@@ -1,7 +1,7 @@
 """Entry script – keeps top level crisp so you can unit‑test package parts."""
 
 import argparse
-from algo.runner import run_live
+from unused_algo.runner import run_live
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Zerodha ML scalper (algo package)")
