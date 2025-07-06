@@ -4,38 +4,46 @@ import numpy as np
 from typing import Tuple, Callable, Optional
 from algo.model import LOOKBACK
 
-# Zerodha fee schedule constants
-# Intraday equity: brokerage is min(0.03% of turnover, ₹20 per executed order)
-BROKERAGE_RATE = 0.0003
-MAX_BROKERAGE = 20.0
-# Exchange transaction charge (NSE): 0.00325% of turnover
-TXN_CHARGES_RATE = 0.0000325
-# SEBI charges: often ~0.0000005 of turnover
-SEBI_CHARGES_RATE = 0.0000005
-# GST on (brokerage + transaction charges)
-GST_RATE = 0.18
-# Stamp duty on buy-side turnover: 0.003%
-STAMP_DUTY_RATE = 0.00003
+# ─── Zerodha fee constants ──────────────────────────────────────────
+BROKERAGE_RATE   = 0.0003     # 0.03 % per leg, max ₹20
+MAX_BROKERAGE    = 20.0
+TXN_CHARGES_RATE = 0.0000325  # 0.00325 %
+SEBI_CHARGES_RATE= 0.0000005  # 0.00005 %
+GST_RATE         = 0.18       # 18 % on (brokerage + txn)
+STAMP_DUTY_RATE  = 0.00003    # 0.003 %  buy leg only
+STT_RATE         = 0.00025    # 0.025 % sell leg only  ← NEW
 
-def calculate_zerodha_fees(entry_price: float, exit_price: float, quantity: int, debug: bool=False) -> float:
+# ─── Fee function (final) ───────────────────────────────────────────
+def calculate_zerodha_fees(entry_price: float,
+                           exit_price : float,
+                           quantity   : int,
+                           debug: bool = False) -> float:
     """
-    Compute Zerodha-style fees for one round-trip trade of given quantity.
-    If debug=True, prints detailed breakdown.
+    Zerodha round-trip charges for intraday equities.
+    Returns *total fees* (float).  If debug=True it prints a full breakdown.
     """
-    turnover = (entry_price + exit_price) * quantity
-    per_leg_brokerage = min(turnover * BROKERAGE_RATE, MAX_BROKERAGE)
-    brokerage = per_leg_brokerage * 2
-    txn_charges = turnover * TXN_CHARGES_RATE
-    sebi_charges = turnover * SEBI_CHARGES_RATE
-    gst = (brokerage + txn_charges) * GST_RATE
-    stamp_duty = entry_price * quantity * STAMP_DUTY_RATE
-    total_fees = brokerage + txn_charges + sebi_charges + gst + stamp_duty
+    turnover           = (entry_price + exit_price) * quantity
+    per_leg_brokerage  = min(turnover * 0.5 * BROKERAGE_RATE, MAX_BROKERAGE)
+    brokerage          = per_leg_brokerage * 2                          # both legs
+    txn_charges        = turnover * TXN_CHARGES_RATE
+    sebi_charges       = turnover * SEBI_CHARGES_RATE
+    stt_ctt            = exit_price * quantity * STT_RATE               # sell leg only
+    gst                = (brokerage + txn_charges) * GST_RATE           # STT not GST-able
+    stamp_duty         = entry_price * quantity * STAMP_DUTY_RATE       # buy leg only
+
+    total_fees = brokerage + txn_charges + sebi_charges + stt_ctt + gst + stamp_duty
+
     if debug:
         print(f"[fees] entry={entry_price:.2f}, exit={exit_price:.2f}, qty={quantity}")
         print(f"[fees]  > turnover={turnover:.2f}, brokerage(total)={brokerage:.2f} "
-              f"(per leg={per_leg_brokerage:.2f}), txn={txn_charges:.4f}, sebi={sebi_charges:.4f}, gst={gst:.4f}, stamp={stamp_duty:.4f}")
+              f"(per leg={per_leg_brokerage:.2f}), txn={txn_charges:.4f}, "
+              f"sebi={sebi_charges:.4f}, stt={stt_ctt:.4f}, gst={gst:.4f}, "
+              f"stamp={stamp_duty:.4f}")
         print(f"[fees]  >> total fees={total_fees:.4f}\n")
+
     return total_fees
+
+
 
 
 def backtest(
