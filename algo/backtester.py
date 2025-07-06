@@ -1,4 +1,3 @@
-# Enhanced backtester with raw-data diagnostics, detailed trade log, lookback-guard, Zerodha fee calculation (with breakdown), exit reasons, dynamic position sizing and empty-list guards
 import pandas as pd
 import numpy as np
 from typing import Tuple, Callable, Optional
@@ -11,7 +10,7 @@ TXN_CHARGES_RATE = 0.0000325  # 0.00325 %
 SEBI_CHARGES_RATE= 0.0000005  # 0.00005 %
 GST_RATE         = 0.18       # 18 % on (brokerage + txn)
 STAMP_DUTY_RATE  = 0.00003    # 0.003 %  buy leg only
-STT_RATE         = 0.00025    # 0.025 % sell leg only  ← NEW
+STT_RATE         = 0.00025    # 0.025 % sell leg only
 
 # ─── Fee function (final) ───────────────────────────────────────────
 def calculate_zerodha_fees(entry_price: float,
@@ -44,8 +43,6 @@ def calculate_zerodha_fees(entry_price: float,
     return total_fees
 
 
-
-
 def backtest(
     df_raw: pd.DataFrame,
     model,
@@ -70,10 +67,7 @@ def backtest(
     Returns completed trades DataFrame and performance metrics.
     """
     df = df_raw.copy().sort_index()
-    # remove any duplicate bars, keep the first of each timestamp
     df = df[~df.index.duplicated(keep="first")]
-
-    # re‐sort and sanity‐check monotonicity
     df = df.sort_index()
     if not df.index.is_monotonic_increasing and debug:
         print("[backtest] WARNING: index still not monotonic!")
@@ -93,8 +87,6 @@ def backtest(
     signal_count = 0
     total_bars = 0
     skip_count = 0
-    above_count = 0
-    below_count = 0
     probs = []
 
     def record_trade(side, entry_ts, exit_ts, entry_px, exit_px, gross_pnl, fees, qty, net_pnl, equity_after, reason):
@@ -129,6 +121,35 @@ def backtest(
         # guard for lookback
         if idx + 1 < LOOKBACK:
             continue
+
+        # ── end-of-day square-off ───────────────────────────────
+        if idx > 0:
+            prev_ts = df.index[idx-1]
+            if prev_ts.date() != ts.date() and position != 0:
+                exit_price = df.loc[prev_ts, 'close']
+                qty        = abs(position)
+                gross_pnl  = position * (exit_price - entry_price) * fill_rate
+                fees       = calculate_zerodha_fees(entry_price, exit_price, qty, debug)
+                net_pnl    = gross_pnl - fees
+                equity    += net_pnl
+                record_trade(
+                    side        = 'BUY' if position>0 else 'SELL',
+                    entry_ts    = entry_index,
+                    exit_ts     = prev_ts,
+                    entry_px    = entry_price,
+                    exit_px     = exit_price,
+                    gross_pnl   = gross_pnl,
+                    fees        = fees,
+                    qty         = qty,
+                    net_pnl     = net_pnl,
+                    equity_after= equity,
+                    reason      = 'EOD'
+                )
+                position    = 0
+                entry_price = 0.0
+                entry_index = None
+                continue
+
         window = df.iloc[idx + 1 - LOOKBACK : idx + 1]
         row = df.iloc[idx]
         if skip_indicator and skip_indicator(row):
@@ -145,7 +166,6 @@ def backtest(
         if position == 0:
             if prob >= upper or prob <= lower:
                 signal_count += 1
-                # size using full available equity
                 qty = int(equity // price)
                 if qty < 1:
                     if debug:
@@ -158,8 +178,6 @@ def backtest(
                 if debug:
                     print(f"{ts} SIGNAL {side_str} @ prob={prob:.3f}")
                     print(f"{ts} ENTRY {side_str} @ qty={qty} price={entry_price:.2f}\n")
-                # reset counters for exit-tracking
-                entry_ts = ts
                 continue
 
         # EXIT conditions
@@ -191,13 +209,29 @@ def backtest(
                 if debug:
                     print(f"{ts} EXIT {exit_reason} {side_str} @ price={exit_price:.2f} qty={qty} | "
                           f"Gross={gross_pnl:.2f} Fees={fees:.2f} Net={net_pnl:.2f}\n")
-                print(f"Debug: qty={qty}\n")#temp code
-                record_trade(side_str, entry_index, ts, entry_price, exit_price,
-                             gross_pnl, fees, qty, net_pnl, equity, exit_reason)
-                # reset position
+                record_trade(
+                    side_str, entry_index, ts, entry_price,
+                    exit_price, gross_pnl, fees, qty, net_pnl, equity, exit_reason
+                )
                 position = 0
                 entry_price = 0.0
                 entry_index = None
+
+    # final end-of-data square-off
+    if position != 0:
+        last_ts    = df.index[-1]
+        exit_price = df.iloc[-1]['close']
+        qty        = abs(position)
+        gross_pnl  = position * (exit_price - entry_price) * fill_rate
+        fees       = calculate_zerodha_fees(entry_price, exit_price, qty, debug)
+        net_pnl    = gross_pnl - fees
+        equity    += net_pnl
+        record_trade(
+            'BUY' if position>0 else 'SELL', entry_index, last_ts,
+            entry_price, exit_price, gross_pnl, fees, qty,
+            net_pnl, equity, 'EOD'
+        )
+        position = 0
 
     # diagnostics
     if debug:
