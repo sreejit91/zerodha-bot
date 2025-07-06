@@ -1,7 +1,7 @@
 import pandas as pd
 
 # Updated feature generation to include ret1 for live WS ticks
-FEATURES = ['ret1', 'ema_3', 'ema_8', 'vwap', 'vol_spike']
+FEATURES = ['ret1', 'ema_8', 'ema_21', 'vwap', 'vol_spike']
 
 
 def add_indicators(df: pd.DataFrame, debug: bool = False) -> pd.DataFrame:
@@ -23,12 +23,12 @@ def add_indicators(df: pd.DataFrame, debug: bool = False) -> pd.DataFrame:
     if debug:
         print("ret1 head:", df['ret1'].head().tolist())
 
-    # 3️⃣ EMA-3 & EMA-8 on close
-    df['ema_3'] = df['close'].ewm(span=3, adjust=False).mean()
+    # 3️⃣ EMA-8 & EMA-21 on close
     df['ema_8'] = df['close'].ewm(span=8, adjust=False).mean()
+    df['ema_21'] = df['close'].ewm(span=21, adjust=False).mean()
     if debug:
-        print("ema_3 head:", df['ema_3'].head().tolist())
         print("ema_8 head:", df['ema_8'].head().tolist())
+        print("ema_21 head:", df['ema_21'].head().tolist())
 
     # 4️⃣ Manual VWAP, reset each day
     tp = (df['high'] + df['low'] + df['close']) / 3
