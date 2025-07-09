@@ -7,16 +7,16 @@ import pathlib
 import pandas as pd
 import numpy as np
 import itertools
-from typing import Dict, Any, List, Tuple
+from typing import List, Tuple
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
 
-from algo.config import load_config
-from algo.broker import KiteWrapper
-from algo.features import add_indicators
-from algo.reg_model import load_or_train_reg, predict_last_reg
-from algo.backtester import backtest
+from algo import load_config
+from algo import KiteWrapper
+from algo import add_indicators
+from algo import load_or_train_reg, predict_last_reg
+from algo import backtest
 
 def walk_forward_splits(
     df: pd.DataFrame,

@@ -11,7 +11,7 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 
-from algo.features import FEATURES, add_indicators
+from algo import FEATURES, add_indicators
 
 LOOKBACK  = 40
 MODELPATH = pathlib.Path(__file__).with_name("hist_model.pkl")

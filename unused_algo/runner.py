@@ -7,12 +7,12 @@ import threading
 import logging
 import pandas as pd
 
-from algo.broker import KiteWrapper
-from algo.features import add_indicators
-from algo.model import load_or_train, LOOKBACK
-from algo.signals import generate_signal
-from algo.logger import TradeLogger
-from algo.config import load_config
+from algo import KiteWrapper
+from algo import add_indicators
+from algo import load_or_train, LOOKBACK
+from algo import generate_signal
+from algo import TradeLogger
+from algo import load_config
 
 
 logger = logging.getLogger(__name__)

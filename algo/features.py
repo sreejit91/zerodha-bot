@@ -1,52 +1,78 @@
+# ── Monkey‐patch NumPy so pandas_ta can import ─────────────────────────
+import numpy as _np
+if not hasattr(_np, "NaN"):
+    _np.NaN = _np.nan
+
 import pandas as pd
+import pandas_ta as ta
 
-# Updated feature generation to include ret1 for live WS ticks
-FEATURES = ['ret1', 'ema_8', 'ema_21', 'vwap', 'vol_spike']
+# ─── Tweak this list to turn indicators on/off ─────────────────────────
+ENABLED = [
+    "ret1", "ema_8", "ema_21",
+    "rsi_14", "macd", "vwap",
+    "vol_spike", "bollinger",
+    "stochastic", "obv", "supertrend",
+]
 
-
-def add_indicators(df: pd.DataFrame, debug: bool = False) -> pd.DataFrame:
-    """
-    Add intraday technical indicators to the DataFrame.
-    Indicators enabled: ret1, EMA-3, EMA-8, VWAP, volume spike.
-    Works whether index is naive or tz-aware.
-    """
+def add_indicators(df: pd.DataFrame, debug: bool=False) -> pd.DataFrame:
+    # ① normalize index
     df = df.copy()
-
-    # 1️⃣ Ensure datetime index, drop tz if present
     if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index, utc=True)
+        df.index = pd.to_datetime(df.index)
     elif df.index.tz is not None:
-        df.index = df.index.tz_convert('UTC').tz_localize(None)
+        df.index = df.index.tz_convert(None)
 
-    # 2️⃣ ret1: 1-period return (pct change or diff)
-    df['ret1'] = df['close'].pct_change().fillna(0)
-    if debug:
-        print("ret1 head:", df['ret1'].head().tolist())
+    # ② loop over each enabled feature
+    for feat in ENABLED:
+        if feat == "ret1":
+            df["ret1"] = df["close"].pct_change().fillna(0)
 
-    # 3️⃣ EMA-8 & EMA-21 on close
-    df['ema_8'] = df['close'].ewm(span=8, adjust=False).mean()
-    df['ema_21'] = df['close'].ewm(span=21, adjust=False).mean()
-    if debug:
-        print("ema_8 head:", df['ema_8'].head().tolist())
-        print("ema_21 head:", df['ema_21'].head().tolist())
+        elif feat.startswith("ema_"):
+            n = int(feat.split("_")[1])
+            df[f"ema_{n}"] = df["close"].ewm(span=n, adjust=False).mean()
 
-    # 4️⃣ Manual VWAP, reset each day
-    tp = (df['high'] + df['low'] + df['close']) / 3
-    tpv = tp * df['volume']
-    dates = df.index.date
-    df['cum_tpv'] = tpv.groupby(dates).cumsum()
-    df['cum_vol'] = df['volume'].groupby(dates).cumsum()
-    df['vwap'] = df['cum_tpv'] / df['cum_vol']
-    if debug:
-        print("vwap head:", df['vwap'].head().tolist())
+        elif feat.startswith("rsi_"):
+            n = int(feat.split("_")[1])
+            df[f"rsi_{n}"] = ta.rsi(df["close"], length=n)
 
-    # 5️⃣ Volume spike: 1 if volume > 2× rolling-20 average
-    df['vol_avg_20'] = df['volume'].rolling(20, min_periods=1).mean()
-    df['vol_spike'] = (df['volume'] > 2 * df['vol_avg_20']).astype(int)
-    if debug:
-        print("vol_spike head:", df['vol_spike'].head().tolist())
+        elif feat == "macd":
+            macd = ta.macd(df["close"], fast=12, slow=26, signal=9)
+            df = pd.concat([df, macd], axis=1)
 
-    # 6️⃣ Clean up temporary columns
-    df.drop(columns=['cum_tpv', 'cum_vol', 'vol_avg_20'], inplace=True)
+        elif feat == "vwap":
+            df["vwap"] = ta.vwap(df["high"], df["low"], df["close"], df["volume"])
+
+        elif feat == "vol_spike":
+            vol_avg = df["volume"].rolling(20, min_periods=1).mean()
+            df["vol_spike"] = (df["volume"] > 2 * vol_avg).astype(int)
+
+        elif feat == "bollinger":
+            bb = ta.bbands(df["close"], length=20, std=2)
+            df["bb_mid"]   = bb[f"BBM_20_2.0"]
+            df["bb_lower"] = bb[f"BBL_20_2.0"]
+            df["bb_upper"] = bb[f"BBU_20_2.0"]
+            df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / df["bb_mid"]
+
+        elif feat == "stochastic":
+            # raw %K over 14, %D = 3-period SMA of %K
+            low  = df["low"].rolling(14, min_periods=1).min()
+            high = df["high"].rolling(14, min_periods=1).max()
+            k    = 100 * (df["close"] - low) / (high - low)
+            df["stoch_k"] = k
+            df["stoch_d"] = k.rolling(3, min_periods=1).mean()
+
+        elif feat == "obv":
+            df["obv"] = ta.obv(df["close"], df["volume"])
+
+        elif feat == "supertrend":
+            st = ta.supertrend(df["high"], df["low"], df["close"], length=10, multiplier=3)
+            df["supertrend"]     = st[f"SUPERT_10_3.0"]
+            df["supertrend_dir"] = st[f"SUPERTd_10_3.0"]
+
+        else:
+            raise ValueError(f"Unknown feature: {feat}")
+
+        if debug:
+            print(f"[feat] computed {feat}")
 
     return df

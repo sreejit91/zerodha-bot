@@ -1,5 +1,5 @@
 # paper_trade.py
-from unused_algo.runner import run_live
+from algo import run_live
 
 if __name__ == "__main__":
     # This is now the real “main” interpreter,
