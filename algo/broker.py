@@ -14,8 +14,8 @@ import pandas as pd
 from kiteconnect import KiteConnect, KiteTicker
 from kiteconnect.exceptions import DataException
 
-from .config import load_config
-from .logger import Order
+from algo.config import load_config
+from algo.logger import Order
 
 print(f"[broker] loaded from {__file__}")
 

@@ -1,0 +1,7 @@
+{
+  "api_key":        "jbxw35dzeziiv6xg",
+  "api_secret":     "ewirxpjeya32oe461idyuxyxitj4ttym",
+  "access_token":   "ibf3umITW9huer0HiP4B3KqMlqbceaTP",
+  "tradingsymbol": "RELIANCE",
+  "exchange":      "NSE"
+}

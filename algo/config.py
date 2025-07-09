@@ -1,8 +1,11 @@
+# algo/config.py
+
 import json
 from dataclasses import dataclass
 from pathlib import Path
 
-CONFIG_PATH = Path(__file__).parent.parent / "config.json"
+# Look for config.json in the same directory as this file
+CONFIG_PATH = Path(__file__).parent / "config.json"
 
 @dataclass
 class KiteCreds:
@@ -11,8 +14,7 @@ class KiteCreds:
     access_token: str
     tradingsymbol: str
     exchange: str
-    instrument_token: int | None = None  # auto-filled
-
+    instrument_token: int | None = None
 
 def load_config() -> KiteCreds:
     data = json.loads(CONFIG_PATH.read_text())

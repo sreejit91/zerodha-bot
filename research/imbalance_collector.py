@@ -7,7 +7,7 @@ your live trades DB.
 import csv, datetime as dt, pathlib, sys
 from kiteconnect import KiteTicker
 
-from algo.broker import KiteWrapper, _resolve_token   # live broker code
+from algo import KiteWrapper, _resolve_token   # live broker code
 from research.config import load_config               # reads project-root config.json
 
 # ── 1) Credentials & token ──────────────────────────────────────────

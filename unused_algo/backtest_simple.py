@@ -1,10 +1,10 @@
 # backtest_simple.py
 
-from algo.broker       import KiteWrapper
-from algo.config       import load_config
-from unused_algo.ind_features import add_indicators
-from unused_algo.simple_model import load_or_train_simple, predict_last_simple
-from algo.backtester   import backtest
+from algo import KiteWrapper
+from algo import load_config
+from algo import add_indicators
+from algo import load_or_train_simple, predict_last_simple
+from algo import backtest
 
 # 1️⃣ Parameters
 SYMBOL     = "HDFCBANK"

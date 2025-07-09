@@ -3,11 +3,11 @@ import datetime as dt, sys, collections, itertools
 import pandas as pd
 from kiteconnect import KiteTicker
 
-from algo.config     import load_config
-from algo.broker     import KiteWrapper
-from algo.features   import add_indicators
-from algo.model      import load_or_train, predict_last, LOOKBACK
-from algo.backtester import calculate_zerodha_fees
+from algo import load_config
+from algo import KiteWrapper
+from algo import add_indicators
+from algo import load_or_train, predict_last, LOOKBACK
+from algo import calculate_zerodha_fees
 
 # 🚀  TRADE LOGGER with trade_id support
 from logger import TradeLogger, OpenTrade, CloseTrade

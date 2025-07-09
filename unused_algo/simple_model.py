@@ -1,7 +1,7 @@
 from __future__ import annotations
 import pandas as pd
 
-from unused_algo.ind_features import add_indicators
+from algo import add_indicators
 
 
 def load_or_train_simple(df_raw: pd.DataFrame, retrain: bool = False) -> None:

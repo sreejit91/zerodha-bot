@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 from typing import Tuple, Callable, Optional
-from algo.model import LOOKBACK
+from algo import LOOKBACK
 
 # ─── Zerodha fee constants ──────────────────────────────────────────
 BROKERAGE_RATE   = 0.0003     # 0.03 % per leg, max ₹20
