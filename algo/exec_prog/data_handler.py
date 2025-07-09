@@ -2,7 +2,7 @@
 
 from pathlib import Path
 import pandas as pd
-from features import add_indicators
+from algo.features import add_indicators
 
 class DataHandler:
     def __init__(
