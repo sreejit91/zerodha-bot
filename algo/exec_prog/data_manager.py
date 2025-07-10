@@ -89,7 +89,7 @@ def main():
         print("❌  No valid intervals provided.")
         sys.exit(1)
 
-    data_dir = input("Enter data directory (default 'data'): ").strip() or "data"
+    data_dir = input("Enter data directory (default 'data'): ").strip() or "../data"
     wrap = KiteWrapper()
 
     for symbol in syms:

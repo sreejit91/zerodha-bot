@@ -14,7 +14,7 @@ def main():
     secs = input("Enter intervals in seconds [leave blank to skip bars]: ")
     intervals = [int(s) for s in secs.split(",")] if secs.strip() else []
 
-    data_dir = input("Enter data directory (default 'data'): ").strip() or "data"
+    data_dir = input("Enter data directory (default 'live_tick_data'): ").strip() or "../live_tick_data"
     print(f"[collect_ticks] Using data directory: {data_dir}")
     os.makedirs(data_dir, exist_ok=True)
 
