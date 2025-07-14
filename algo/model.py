@@ -10,45 +10,79 @@ import lightgbm as lgb                              # pip install lightgbm
 
 from algo.features import FEATURES, add_indicators  # your indicators list
 
-LOOKBACK   = 60
+LOOKBACK   = 30
+HORIZON = 5
 _MODELPATH = pathlib.Path(__file__).with_suffix(".pkl")
 
 # --------------------------- helpers ----------------------------------------
 def _make_sliding_X(df: pd.DataFrame) -> np.ndarray:
-    win  = len(FEATURES)
-    arr  = df[FEATURES].to_numpy("float64")
+    win = len(FEATURES)
+    arr = df[FEATURES].to_numpy("float64")
     view = np.lib.stride_tricks.sliding_window_view(arr, (LOOKBACK, win))
     return view.reshape(view.shape[0], -1)
 
-def _prepare_xy(df_feat: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-    df = add_indicators(df_feat.copy())
-    df[FEATURES] = df[FEATURES].apply(pd.to_numeric, errors="coerce")
-    df["ret1"]   = df["close"].pct_change()
 
-    X_all = _make_sliding_X(df)
-    if X_all.shape[0] < 2:
-        return np.empty((0, LOOKBACK * len(FEATURES))), np.empty((0,), dtype=int)
 
-    X     = X_all[:-1]
-    y_raw = df["ret1"].shift(-1)
-    y     = (y_raw.iloc[LOOKBACK - 1 : -1] > 0).astype(int).to_numpy()
+def _prepare_xy(df: pd.DataFrame, horizon: int = 5) -> tuple[np.ndarray, np.ndarray]:
+    df = df.copy()
 
-    # Use np.isfinite instead of just ~np.isnan for NaN and Inf
-    mask  = np.isfinite(X).all(axis=1)
-    return X[mask], y[mask]
+    # Step 1: Forward return and volatility
+    df["future_return"] = df["close"].shift(-horizon) / df["close"] - 1
+    df["volatility"] = df["close"].pct_change().rolling(20).std()
+
+    # Step 2: Added feature: Price vs VWAP
+    df["price_vs_vwap"] = df["close"] - df.get("vwap", df["close"])
+
+    # ✅ NEW FEATURES
+    df["trend_strength"] = (df["macd"] - df["macd_signal"]).abs()
+    df["vwap_gap"] = df["close"] - df.get("vwap", df["close"])
+    df["bb_position"] = (df["close"] - df["bb_lower"]) / (df["bb_upper"] - df["bb_lower"] + 1e-6)
+
+    # Step 3: Label thresholds
+    return_threshold = 0.0007 * horizon
+    vol_threshold = 0.0003
+
+    long_mask = (df["future_return"] > return_threshold) & (df["volatility"] > vol_threshold)
+    short_mask = (df["future_return"] < -return_threshold) & (df["volatility"] > vol_threshold)
+
+    df = df[long_mask | short_mask].copy()
+    df["label"] = 0
+    df.loc[long_mask, "label"] = 1
+
+    # Step 4: Ensure required features are in list
+    extra_feats = ["price_vs_vwap", "trend_strength", "vwap_gap", "bb_position"]
+    for feat in extra_feats:
+        if feat not in FEATURES:
+            FEATURES.append(feat)
+
+    # Step 5: Drop bad rows and create X, y
+    df.dropna(subset=FEATURES + ["label"], inplace=True)
+    X_all = _make_sliding_X(df)[:-horizon]
+    y_all = df["label"].iloc[LOOKBACK - 1 : -horizon].to_numpy()
+
+    # Step 6: Final filter
+    mask = np.isfinite(X_all).all(axis=1)
+    print(f"Prepared {len(y_all[mask])} samples | Class balance (mean): {np.mean(y_all[mask]):.3f}")
+    return X_all[mask], y_all[mask]
+
+
 
 
 def _build_pipe() -> Pipeline:
     lgb_params = dict(
-        n_estimators     = 600,
-        learning_rate    = 0.05,
-        num_leaves       = 31,
-        subsample        = 0.8,
-        colsample_bytree = 0.8,
-        random_state     = 0,
-        n_jobs           = -1,
-        metric           = "auc",
-        verbose          = -1,        # OK *here* (constructor)
+    n_estimators= 1050,
+    learning_rate= 0.017537607442521964,
+    num_leaves= 76,
+    max_depth= 5,
+    min_child_samples= 96,
+    subsample= 0.9284965223502559,
+    colsample_bytree= 0.7023760690478573,
+    reg_alpha= 1.6898034700530933,
+    reg_lambda= 1.9674841696814904,
+    random_state= 0,
+    n_jobs= -1,
+    metric= 'auc',
+    verbose= -1
     )
     return Pipeline([
         ("imputer", SimpleImputer(strategy="mean")),
@@ -56,11 +90,11 @@ def _build_pipe() -> Pipeline:
     ])
 
 # ------------------------ train / load --------------------------------------
-def load_or_train(df: pd.DataFrame, retrain: bool = False) -> Pipeline:
+def load_or_train(df: pd.DataFrame, retrain: bool = False, horizon =5) -> Pipeline:
     if _MODELPATH.exists() and not retrain:
         return joblib.load(_MODELPATH)
 
-    X, y           = _prepare_xy(df)
+    X, y           = _prepare_xy(df, horizon=horizon)
     Xtr, Xval, ytr, yval = train_test_split(X, y, test_size=0.2, shuffle=False)
 
     pipe = _build_pipe()
@@ -86,9 +120,24 @@ def load_or_train(df: pd.DataFrame, retrain: bool = False) -> Pipeline:
     return pipe
 
 # -------------------------- inference ---------------------------------------
-def predict_last(df_feat: pd.DataFrame, model: Pipeline) -> float:
-    df = add_indicators(df_feat.copy())
-    df[FEATURES] = df[FEATURES].apply(pd.to_numeric, errors="coerce")
-    arr = df[FEATURES].iloc[-LOOKBACK:].to_numpy("float64")
-    X_last = arr.flatten().reshape(1, -1)
-    return float(model.predict_proba(X_last)[0, 1])
+def predict_last(df_window: pd.DataFrame, model: Pipeline) -> float:
+    from algo.features import FEATURES
+
+    LOOKBACK = model.n_features_in_ // len(FEATURES)
+
+    if len(df_window) < LOOKBACK:
+        return np.nan  # too short
+
+    df_window = df_window.copy()
+    df_window[FEATURES] = df_window[FEATURES].apply(pd.to_numeric, errors="coerce")
+    X = df_window[FEATURES].iloc[-LOOKBACK:]
+
+    if X.isnull().values.any():
+        return np.nan
+
+    arr = X.to_numpy("float64").flatten().reshape(1, -1)
+    return float(model.predict_proba(arr)[0, 1])
+
+
+
+
