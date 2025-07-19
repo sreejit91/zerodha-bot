@@ -1,135 +1,187 @@
-import pandas as pd
+# ── algo/backtester.py ───────────────────────────────────────────
+from __future__ import annotations
+
 import numpy as np
-from typing import Tuple, Callable, Optional
+import pandas as pd
+from typing import Callable, Any, Tuple, Dict
 
-# Zerodha fees calculation — as per your formula
-def calculate_zerodha_fees(entry_price: float, exit_price: float, quantity: int, debug: bool = False) -> float:
-    turnover = (entry_price + exit_price) * quantity
-    per_leg_brokerage = np.minimum(turnover * 0.0003,20)
-    brokerage = per_leg_brokerage * 2
-    txn_charges = turnover * 0.0000325
-    sebi_charges = turnover * 0.0000005
-    stt_ctt = exit_price * quantity * 0.00025
-    gst = (brokerage + txn_charges) * 0.18
-    stamp_duty = entry_price * quantity * 0.00003
-    total_fees = brokerage + txn_charges + sebi_charges + stt_ctt + gst + stamp_duty
-    if debug:
-        print(f"[fees] total={total_fees:.2f} on qty={quantity} from {entry_price:.2f} → {exit_price:.2f}")
-    return total_fees
+# These two **must** match add_labels() & model.py
+HORIZON        = 24         # bars the label looks ahead
+THR_ATR_MULT   = 1.0        # ATR‑multiple for both label & TP/SL
 
-def backtest_ML_switchable(
+# Brokerage / micro‑structure constants
+BROKERAGE_CAP  = 20         # ₹ cap per leg at Zerodha
+SLIPPAGE_BPS   = 3          # 0.03 % slip each side
+
+# ─────────────────────────────────────────────────────────────────
+def calculate_zerodha_fees(entry, exit, qty):
+    """
+    Zerodha equity‑intraday cost model.
+    Vectorised: works on scalars **and** NumPy / pandas arrays.
+    """
+    entry_arr = np.asarray(entry, dtype="float64")
+    exit_arr  = np.asarray(exit,  dtype="float64")
+
+    turnover       = (entry_arr + exit_arr) * qty
+    brokerage_buy  = np.minimum(entry_arr * qty * 0.0003, BROKERAGE_CAP)
+    brokerage_sell = np.minimum(exit_arr  * qty * 0.0003, BROKERAGE_CAP)
+    brokerage      = brokerage_buy + brokerage_sell
+    txn_charges    = turnover * 0.0000325
+    sebi_charges   = turnover * 0.0000005
+    stt_sell       = exit_arr * qty * 0.00025          # sell only
+    gst            = (brokerage + txn_charges) * 0.18
+    stamp_buy      = entry_arr * qty * 0.00003         # buy only
+
+    total = brokerage + txn_charges + sebi_charges + stt_sell + gst + stamp_buy
+
+    if np.isscalar(entry):
+        return float(total)
+    if isinstance(entry, pd.Series):
+        return pd.Series(total, index=entry.index)
+    return total
+
+
+def apply_slippage(price: float, side: int, bps: float = SLIPPAGE_BPS) -> float:
+    """Slip price by ±bps (basis points).  side: +1 long leg, ‑1 short leg."""
+    return price * (1 + side * bps / 1e4)
+
+
+# ─────────────────────────────────────────────────────────────────
+def backtest(
     df: pd.DataFrame,
-    model,
-    predict_fn: Callable,             # (window_df, model) → prob
-    entry_rule_fn: Callable,          # (row, prob, state) → {'entry': 1, 'side': 'BUY'/'SELL'} or None
-    exit_rule_fn: Optional[Callable], # (row, prob, state) → (reason, price) or None
+    model: Any,
+    predict_fn: Callable[[pd.DataFrame, Any], Tuple[float, float]],
+    *,
     capital: float,
     contract_size: int,
-    lookback: int,
-    sl_pct: float = 0.01,
-    tp_pct: float = 0.02,
+    lookback: int = 60,
+    tp_atr_mult: float | None = None,
+    sl_atr_mult: float | None = None,
+    max_hold_bars: int | None = None,
     debug: bool = False,
-) -> Tuple[pd.DataFrame, dict]:
-    df = df.copy().sort_index()
-    trades = []
-    equity = capital
-    position = 0
-    entry_price = 0
-    entry_index = None
-    entry_prob = None
-    regime = None
+) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    """
+    ML‑probability‑driven intraday back‑tester (3‑class aware):
 
-    # --- ML probabilities (precompute for speed) ---
-    probs = [np.nan] * len(df)
-    for idx in range(lookback, len(df)):
-        window = df.iloc[idx - lookback:idx]
-        prob = predict_fn(window, model)
-        probs[idx] = prob
-    df['ml_prob'] = probs
-    print("Non-NaN ml_prob:", np.isfinite(df['ml_prob']).sum(), "out of", len(df))
-    print(df[['ml_prob']].describe())
+      • EV‑based entry using both p_long and p_short
+      • Fractional Kelly sizing
+      • TP / SL aligned with labeling horizon & threshold
+      • Realistic slippage and Zerodha fee model
+    """
+
+    if "atr" not in df:
+        raise ValueError("`atr` missing – run add_indicators(df) first")
+
+    # -----------------------------------------------------------------
+    tp_atr_mult   = tp_atr_mult   or THR_ATR_MULT
+    sl_atr_mult   = sl_atr_mult   or THR_ATR_MULT
+    max_hold_bars = max_hold_bars or HORIZON
+    df = df.copy()
+
+    # 1) Pre‑compute probabilities for speed
+    p_long_arr  = np.full(len(df), np.nan)
+    p_short_arr = np.full(len(df), np.nan)
+    for i in range(lookback, len(df)):
+        p_long_arr[i], p_short_arr[i] = predict_fn(df.iloc[i - lookback : i], model)
+
+    df["p_long"]  = p_long_arr
+    df["p_short"] = p_short_arr
+
+    # 2) Walk forward
+    trades, equity = [], capital
+    position = 0
+    entry_price = entry_atr = trailing_sl = None
+    entry_idx   = None
 
     for idx, (ts, row) in enumerate(df.iterrows()):
-        if idx < lookback or not np.isfinite(row['ml_prob']):
-            continue
-        prob = row['ml_prob']
-        state = dict(position=position, equity=equity, entry_price=entry_price, entry_index=entry_index, prob=prob)
+        p_long, p_short = row["p_long"], row["p_short"]
+        price, atr      = row["close"], row["atr"]
 
-        # ENTRY LOGIC (configurable)
-        if position == 0:
-            entry_signal = entry_rule_fn(row, prob, state)
-            if entry_signal:
-                side = entry_signal.get('side')
-                position = contract_size if side == 'BUY' else -contract_size
-                entry_price = row['close']
-                entry_index = ts
-                entry_prob = prob
-                regime = entry_signal.get('regime', None)
+        # ── ENTRY ───────────────────────────────────────────────────
+        if position == 0 and np.isfinite(p_long) and np.isfinite(p_short):
+            ev_long  =  p_long  * tp_atr_mult - p_short * sl_atr_mult
+            ev_short =  p_short * tp_atr_mult - p_long  * sl_atr_mult
+            side     = 1 if ev_long  > 0 else -1 if ev_short > 0 else 0
+            edge     = max(ev_long, ev_short, 0)
+
+            if side != 0:
+                size_frac = np.clip(edge / (tp_atr_mult + sl_atr_mult), 0.1, 1.0)
+                position  = int(contract_size * size_frac) * side
+
+                entry_price = apply_slippage(price, side)
+                entry_atr   = atr if np.isfinite(atr) else 0.0
+                entry_idx   = idx
+
+                tp_price    = entry_price + side * tp_atr_mult * entry_atr
+                sl_price    = entry_price - side * sl_atr_mult * entry_atr
+                trailing_sl = sl_price
+
                 if debug:
-                    print(f"{ts} ENTRY {side} @ {entry_price:.2f} prob={prob:.3f}")
+                    print(f"{ts} ENTRY {'BUY' if side>0 else 'SELL'} "
+                          f"pL={p_long:.3f} pS={p_short:.3f} edge={edge:.3f} "
+                          f"size={position}")
                 continue
 
-        # EXIT LOGIC (configurable or fallback SL/TP/EOD)
+        # ── MANAGE / EXIT ───────────────────────────────────────────
         if position != 0:
-            exit_signal = None
-            if exit_rule_fn:
-                exit_signal = exit_rule_fn(row, prob, dict(position=position, equity=equity, entry_price=entry_price,
-                                                           entry_index=entry_index, prob=prob))
-            exit_reason, exit_price = None, None
-            if exit_signal:
-                exit_reason, exit_price = exit_signal
-            else:
-                # fallback: basic SL/TP/EOD
-                if position > 0 and (row['close'] <= entry_price * (1 - sl_pct)):
-                    exit_reason, exit_price = 'SL', entry_price * (1 - sl_pct)
-                elif position > 0 and (row['close'] >= entry_price * (1 + tp_pct)):
-                    exit_reason, exit_price = 'TP', entry_price * (1 + tp_pct)
-                elif position < 0 and (row['close'] >= entry_price * (1 + sl_pct)):
-                    exit_reason, exit_price = 'SL', entry_price * (1 + sl_pct)
-                elif position < 0 and (row['close'] <= entry_price * (1 - tp_pct)):
-                    exit_reason, exit_price = 'TP', entry_price * (1 - tp_pct)
-                # EOD
-                elif idx == len(df) - 1 or (df.index[idx + 1].date() != ts.date()):
-                    exit_reason, exit_price = 'EOD', row['close']
-            if exit_reason:
-                qty = abs(position)
-                gross_pnl = position * (exit_price - entry_price)
-                fees = calculate_zerodha_fees(entry_price, exit_price, qty, debug)
-                net_pnl = gross_pnl - fees
-                equity += net_pnl
-                trades.append({
-                    "entry_ts": entry_index, "exit_ts": ts,
-                    "side": "BUY" if position > 0 else "SELL",
-                    "entry_price": entry_price, "exit_price": exit_price,
-                    "exit_reason": exit_reason,
-                    "fees": fees, "qty": qty, "gross_pnl": gross_pnl,
-                    "pnl": net_pnl, "equity": equity, "regime": regime, "ml_prob": entry_prob
-                })
-                position, entry_price, entry_index, entry_prob, regime = 0, 0, None, None, None
+            side = 1 if position > 0 else -1
 
+            # Trailing SL candidate
+            if np.isfinite(atr):
+                candidate = price - side * sl_atr_mult * atr
+                trailing_sl = max(trailing_sl, candidate) if side > 0 else min(trailing_sl, candidate)
+
+            exit_reason = None
+            if (side > 0 and price >= tp_price) or (side < 0 and price <= tp_price):
+                exit_reason = "TP"
+            elif (side > 0 and price <= trailing_sl) or (side < 0 and price >= trailing_sl):
+                exit_reason = "SL" if trailing_sl == sl_price else "TRAIL_SL"
+            elif idx - entry_idx >= max_hold_bars:
+                exit_reason = "MAX_HOLD"
+            elif idx == len(df) - 1 or df.index[idx + 1].date() != ts.date():
+                exit_reason = "EOD"
+
+            if exit_reason:
+                exit_price = apply_slippage(price, -side)
+                qty        = abs(position)
+                gross      = position * (exit_price - entry_price)
+                fees       = calculate_zerodha_fees(entry_price, exit_price, qty)
+                net        = gross - fees
+                equity    += net
+
+                trades.append(
+                    {
+                        "entry_ts":    df.index[entry_idx],
+                        "exit_ts":     ts,
+                        "side":        "BUY" if side > 0 else "SELL",
+                        "entry_price": entry_price,
+                        "exit_price":  exit_price,
+                        "atr":         entry_atr,
+                        "qty":         qty,
+                        "gross_pnl":   gross,
+                        "fees":        fees,
+                        "pnl":         net,
+                        "exit_reason": exit_reason,
+                        "p_long":      p_long,
+                        "p_short":     p_short,
+                        "equity":      equity,
+                    }
+                )
+
+                # reset state
+                position = 0
+                entry_price = entry_atr = trailing_sl = None
+                entry_idx   = None
+
+    # ── Post‑run metrics ───────────────────────────────────────────
     trades_df = pd.DataFrame(trades)
-    metrics = {
-        "Trades": len(trades_df),
-        "WinRate": (trades_df["pnl"] > 0).mean() if not trades_df.empty else 0.0,
-        "GrossPnL": trades_df["gross_pnl"].sum() if not trades_df.empty else 0.0,
-        "Fees": trades_df["fees"].sum() if not trades_df.empty else 0.0,
-        "NetPnL": trades_df["pnl"].sum() if not trades_df.empty else 0.0,
+    metrics   = {
+        "Trades":      len(trades_df),
+        "WinRate":     trades_df.pnl.gt(0).mean() if not trades_df.empty else 0.0,
+        "GrossPnL":    trades_df.gross_pnl.sum()  if not trades_df.empty else 0.0,
+        "Fees":        trades_df.fees.sum()       if not trades_df.empty else 0.0,
+        "NetPnL":      trades_df.pnl.sum()        if not trades_df.empty else 0.0,
         "EquityFinal": equity,
     }
     return trades_df, metrics
-
-# EXAMPLE ENTRY RULE FUNCTION (hybrid ML + indicator)
-def hybrid_entry(row, prob, state):
-    # Example: Only allow entry if ML probability > 0.7 and ema_15 > ema_50
-    if prob > 0.51 and row['ema_8'] > row['ema_21']:
-        return {'entry': 1, 'side': 'BUY'}
-    if prob < 0.49 and row['ema_8'] < row['ema_21']:
-        return {'entry': 1, 'side': 'SELL'}
-    return None
-
-# EXAMPLE EXIT RULE FUNCTION (optional, else use fallback)
-def default_exit(row, prob, state):
-    # You can customize more logic here
-    return None
-
-# --- How to call this function is below ---
+# ─────────────────────────────────────────────────────────────────

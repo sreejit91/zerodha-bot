@@ -4,7 +4,7 @@ import pandas as pd
 from algo.backtester import calculate_zerodha_fees
 
 # ╭─ Configurable Hyperparameters ─────────────────────────────╮
-RSI_LEN           = 14
+RSI_LEN           = 2
 VOL_MA_LEN        = 20
 VOL_SPIKE_FACTOR  = 2.0
 ST_LEN            = 10
@@ -22,57 +22,59 @@ KELTNER_LEN       = 20
 ENABLED: list[str] = [
     # --- Classic features ---
     "ret1",
-    # "ret3",
-    "ret5",
+     "ret2",
+    #"ret5",
     #"up_streak",
     #"down_streak",
     "atr",
     # "ret10",
     # "vol_avg20",
-    "ema_8",         # NEW: explicitly add these if you want fast/slow EMAs!
-    "ema_21",
+    "ema_5",         # NEW: explicitly add these if you want fast/slow EMAs!
+    "ema_20","ema5_ema20_diff",
     # "ema_50",
     # "ema_15",
     "vwap",
     "close_vs_vwap",
     #"range_1",
-    "body_1",
+    #"body_1",
     #"is_vol_spike",
     # "vol_change",
     # "close_change",
     # "obv",
-    "rsi_14",
-     "macd", "macd_signal",
-     "supertrend", "supertrend_dir",
+    "rsi_2",
+     #"macd", "macd_signal",
+     #"supertrend", "supertrend_dir",
     # --- New features ---
     #"above_high_10",
-    "below_low_10",
+    #"below_low_10",
     "bb_upper",
     "bb_lower",
-    "bb_upper_touch",
-    "bb_lower_touch",
+    #"bb_upper_touch",
+    #"bb_lower_touch",
     # "bb_mid",
      "bb_width",
     # "stoch_k",
     # "stoch_d",
     # "williams_r",
     # "adx",
-     "atr_median20",
-     "zscore_close",
-     "zscore_volume",
+    # "atr_median20",
+    # "zscore_close",
+    # "zscore_volume",
     # --- Session/lag features ---
     # "close_lag_1", "close_lag_3", "close_lag_5",
     # "volume_lag_1", "volume_lag_5",
-    "volatility_5", "volatility_10", "vol_spike",
+    #"volatility_5", "volatility_10",
+    "vol_spike",
     # "high_low_range","high_N","low_N","channel_mid"
     # "hour",
     # "dayofweek",
-    "minute_of_day",
-    "fees_pct",
+     "hour_sin","hour_cos",
+    #"minute_of_day",
+    #"fees_pct",
     #"pivot_point","pivot_res1","pivot_sup1",
-    "donchian_high","donchian_low","donchian_breakout",
-    "is_doji","is_hammer","is_bullish_engulfing",
-    "body_range_ratio",
+    #"donchian_high","donchian_low","donchian_breakout",
+    #"is_doji","is_hammer","is_bullish_engulfing",
+    #"body_range_ratio",
     #"gap",
     #"clv",
     #"roc_5","roc_10",
@@ -169,7 +171,8 @@ def add_indicators(df: pd.DataFrame, debug: bool = False) -> pd.DataFrame:
     if "close_lag_5" in ENABLED: df["close_lag_5"] = df["close"].shift(5)
     if "volume_lag_1" in ENABLED: df["volume_lag_1"] = df["volume"].shift(1)
     if "volume_lag_5" in ENABLED: df["volume_lag_5"] = df["volume"].shift(5)
-    if "vol_avg20" in ENABLED: df["vol_avg20"] = df["volume"].rolling(window=VOL_WIN, min_periods=1).mean()
+    if "vol_avg20" in ENABLED: df["vol_avg20"] = df["volume"].rolling(window=VOL_WIN).mean()
+    if "vol_dev20" in ENABLED: df["vol_dev20"] = (df["volume"] - df["vol_avg20"]) / df["vol_avg20"]
 
     # Volatility
     if "volatility_5" in ENABLED: df["volatility_5"] = df["close"].pct_change().rolling(5).std()
@@ -185,10 +188,13 @@ def add_indicators(df: pd.DataFrame, debug: bool = False) -> pd.DataFrame:
     if "hour" in ENABLED: df["hour"] = df.index.hour
     if "dayofweek" in ENABLED: df["dayofweek"] = df.index.dayofweek
     if "minute_of_day" in ENABLED: df["minute_of_day"] = df.index.hour * 60 + df.index.minute
+    seconds = (df.index.hour * 3600 + df.index.minute * 60 + df.index.second)
+    if "hour_sin" in ENABLED: df["hour_sin"] = np.sin(2 * np.pi * seconds / 86400)
+    if "hour_cos" in ENABLED: df["hour_cos"] = np.cos(2 * np.pi * seconds / 86400)
 
     # Returns and streaks
     if "ret1" in ENABLED:  df["ret1"] = df["close"].pct_change(1)
-    if "ret3" in ENABLED:  df["ret3"] = df["close"].pct_change(3)
+    if "ret2" in ENABLED:  df["ret2"] = df["close"].pct_change(2)
     if "ret5" in ENABLED:  df["ret5"] = df["close"].pct_change(5)
     if "ret10" in ENABLED: df["ret10"] = df["close"].pct_change(10)
     if "up_streak" in ENABLED: df["up_streak"] = df["close"].diff().gt(0).rolling(5).sum()
@@ -224,22 +230,23 @@ def add_indicators(df: pd.DataFrame, debug: bool = False) -> pd.DataFrame:
     if "is_vol_spike" in ENABLED: df["is_vol_spike"] = (df["vol_spike"] > 2).astype(int)
 
     # EMAs
-    if "ema_8" in ENABLED:
-        df["ema_8"] = df["close"].ewm(span=8, adjust=False, min_periods=8).mean()
-    if "ema_21" in ENABLED:
-        df["ema_21"] = df["close"].ewm(span=21, adjust=False, min_periods=21).mean()
+    if "ema_5" in ENABLED:
+        df["ema_5"] = df["close"].ewm(span=5, adjust=False, min_periods=5).mean()
+    if "ema_20" in ENABLED:
+        df["ema_20"] = df["close"].ewm(span=20, adjust=False, min_periods=20).mean()
     if "ema_50" in ENABLED:
         df["ema_50"] = df["close"].ewm(span=50, adjust=False, min_periods=50).mean()
     if "ema_15" in ENABLED:
         df["ema_15"] = df["close"].ewm(span=15, adjust=False, min_periods=15).mean()
+    if "ema5_ema20_diff" in ENABLED: df["ema5_ema20_diff"] = df["ema_5"] - df["ema_20"]
 
     # RSI
-    if "rsi_14" in ENABLED:
+    if "rsi_2" in ENABLED:
         delta = df["close"].diff()
         up = delta.clip(lower=0).rolling(RSI_LEN).mean()
         dn = (-delta.clip(upper=0)).rolling(RSI_LEN).mean()
         rs = up / dn
-        df["rsi_14"] = 100 - 100 / (1 + rs)
+        df["rsi_2"] = 100 - 100 / (1 + rs)
 
     # MACD
     if {"macd", "macd_signal"} & set(ENABLED):
@@ -388,39 +395,42 @@ def add_indicators(df: pd.DataFrame, debug: bool = False) -> pd.DataFrame:
     if debug:
         print("\nPreview of computed indicators:")
         print(df[FEATURES].head(25))
+
+
     return df
 
 
-# --- Label Creation Logic (unchanged) ---
-def add_labels(
-    df: pd.DataFrame,
-    horizon: int = 5,
-    return_threshold_per_bar: float = 0.0007,
-    vol_threshold: float = 0.0003,
-    inplace: bool = False
-) -> pd.DataFrame:
-    if not inplace:
-        df = df.copy()
-    df["future_return"] = df["close"].shift(-horizon) / df["close"] - 1
-    df["volatility"] = df["close"].pct_change().rolling(20).std()
-    if "vwap" in df.columns:
-        df["price_vs_vwap"] = df["close"] - df["vwap"]
-        df["vwap_gap"] = df["close"] - df["vwap"]
-    else:
-        df["price_vs_vwap"] = 0
-        df["vwap_gap"] = 0
-    if "macd" in df.columns and "macd_signal" in df.columns:
-        df["trend_strength"] = (df["macd"] - df["macd_signal"]).abs()
-    else:
-        df["trend_strength"] = 0
-    if "bb_upper" in df.columns and "bb_lower" in df.columns:
-        df["bb_position"] = (df["close"] - df["bb_lower"]) / (df["bb_upper"] - df["bb_lower"] + 1e-6)
-    else:
-        df["bb_position"] = 0
 
-    return_threshold = return_threshold_per_bar * horizon
-    long_mask = (df["future_return"] > return_threshold) & (df["volatility"] > vol_threshold)
-    short_mask = (df["future_return"] < -return_threshold) & (df["volatility"] > vol_threshold)
-    df["label"] = 0
-    df.loc[long_mask, "label"] = 1
-    return df
+
+# ─── Label generator aligned with live TP/SL ──────────────────────
+HORIZON      = 24      # ≈ one trading day if you use 5‑min bars
+THR_ATR_MULT = 1.0     # must match tp/sl multiples below
+
+def add_labels(df: pd.DataFrame,
+               horizon: int = HORIZON,
+               thr_atr_mult: float = THR_ATR_MULT,
+               drop_flat: bool = False) -> pd.DataFrame:
+    """
+    3‑class horizon label:
+        +1  ‑ future_ret > +thr
+        -1  ‑ future_ret < -thr
+         0  ‑ in‑between
+    `drop_flat=True` switches to binary by discarding the 0‑class.
+    """
+    if "atr" not in df:
+        raise ValueError("run add_indicators(df) first")
+
+    df = df.copy()
+    df["future_ret"] = df["close"].shift(-horizon) / df["close"] - 1
+    thr              = df["atr"] / df["close"] * thr_atr_mult
+
+    df["label"] = np.select(
+        [df.future_ret >  thr,
+         df.future_ret < -thr],
+        [ 1, -1], default=0
+    ).astype("int8")
+
+    if drop_flat:
+        df = df[df.label != 0]
+
+    return df.drop(columns="future_ret")
